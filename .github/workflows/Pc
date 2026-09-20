@@ -1,0 +1,419 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+PROJECT="$HOME/gaming-vm"
+CONFIG="$PROJECT/vm.env"
+
+echo "========================================="
+echo "       GAMING VM - INSTALAÇÃO"
+echo "========================================="
+
+if [[ $EUID -eq 0 ]]; then
+    echo "Não execute este script diretamente como root."
+    echo "Execute:"
+    echo "  bash setup-gaming-vm.sh"
+    exit 1
+fi
+
+if command -v apt >/dev/null 2>&1; then
+    echo "[1/7] Instalando dependências..."
+
+    sudo apt update
+
+    sudo apt install -y \
+        qemu-system-x86 \
+        qemu-utils \
+        libvirt-daemon-system \
+        libvirt-clients \
+        virt-manager \
+        ovmf \
+        bridge-utils \
+        dnsmasq \
+        pciutils \
+        python3 \
+        python3-venv \
+        swtpm \
+        swtpm-tools
+
+elif command -v dnf >/dev/null 2>&1; then
+    echo "[1/7] Instalando dependências..."
+
+    sudo dnf install -y \
+        qemu-kvm \
+        qemu-img \
+        libvirt \
+        virt-manager \
+        edk2-ovmf \
+        bridge-utils \
+        dnsmasq \
+        pciutils \
+        python3 \
+        swtpm \
+        swtpm-tools
+
+else
+    echo "Distribuição Linux não reconhecida."
+    echo "Este instalador suporta Ubuntu/Debian e Fedora."
+    exit 1
+fi
+
+echo "[2/7] Criando projeto..."
+
+mkdir -p "$PROJECT"
+mkdir -p "$PROJECT/images"
+mkdir -p "$PROJECT/iso"
+
+echo "[3/7] Configurando serviços..."
+
+sudo systemctl enable --now libvirtd 2>/dev/null || true
+sudo systemctl enable --now libvirt 2>/dev/null || true
+
+sudo usermod -aG libvirt "$USER" 2>/dev/null || true
+sudo usermod -aG kvm "$USER" 2>/dev/null || true
+
+echo "[4/7] Criando configuração..."
+
+cat > "$CONFIG" <<'EOF'
+# ==========================================
+# GAMING VM
+# ==========================================
+
+VM_NAME="gaming-vm"
+
+# RAM em MB
+RAM_MB="16384"
+
+# CPUs virtuais
+VCPUS="8"
+
+# Disco
+DISK="$HOME/gaming-vm/images/gaming-vm.qcow2"
+DISK_SIZE="150G"
+
+# ISO do Windows
+WINDOWS_ISO="$HOME/gaming-vm/iso/Windows.iso"
+
+# ISO VirtIO
+VIRTIO_ISO="$HOME/gaming-vm/iso/virtio-win.iso"
+
+# GPU PCI
+# ALTERE DEPOIS DE EXECUTAR:
+# lspci -nn
+GPU=""
+
+# Áudio HDMI/DisplayPort da GPU
+GPU_AUDIO=""
+
+# Rede
+NETWORK="default"
+EOF
+
+echo "[5/7] Criando controlador..."
+
+cat > "$PROJECT/vmctl.py" <<'PYEOF'
+#!/usr/bin/env python3
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+BASE = Path.home() / "gaming-vm"
+CONFIG = BASE / "vm.env"
+
+
+def load_config():
+    config = {}
+
+    if not CONFIG.exists():
+        print("Configuração não encontrada.")
+        sys.exit(1)
+
+    for line in CONFIG.read_text().splitlines():
+        line = line.strip()
+
+        if not line or line.startswith("#"):
+            continue
+
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+
+        value = value.strip().strip('"').strip("'")
+
+        config[key.strip()] = os.path.expandvars(
+            os.path.expanduser(value)
+        )
+
+    return config
+
+
+def command(cmd):
+    print("\n$", " ".join(cmd))
+    return subprocess.run(cmd)
+
+
+def create_disk(cfg):
+    disk = cfg["DISK"]
+    size = cfg["DISK_SIZE"]
+
+    path = Path(disk)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if path.exists():
+        print("Disco já existe:")
+        print(path)
+        return
+
+    command([
+        "qemu-img",
+        "create",
+        "-f",
+        "qcow2",
+        str(path),
+        size
+    ])
+
+
+def start(cfg):
+    create_disk(cfg)
+
+    name = cfg["VM_NAME"]
+    ram = cfg["RAM_MB"]
+    cpus = cfg["VCPUS"]
+    disk = cfg["DISK"]
+    iso = cfg["WINDOWS_ISO"]
+    virtio = cfg["VIRTIO_ISO"]
+
+    cmd = [
+        "qemu-system-x86_64",
+
+        "-enable-kvm",
+
+        "-name",
+        name,
+
+        "-machine",
+        "q35,accel=kvm",
+
+        "-cpu",
+        "host",
+
+        "-smp",
+        cpus,
+
+        "-m",
+        ram,
+
+        "-drive",
+        f"file={disk},if=virtio,format=qcow2,cache=none,aio=native",
+
+        "-drive",
+        f"file={iso},media=cdrom,readonly=on",
+
+        "-drive",
+        f"file={virtio},media=cdrom,readonly=on",
+
+        "-boot",
+        "menu=on",
+
+        "-device",
+        "virtio-net-pci,netdev=net0",
+
+        "-netdev",
+        "user,id=net0",
+
+        "-device",
+        "virtio-rng-pci",
+
+        "-device",
+        "virtio-balloon-pci",
+
+        "-display",
+        "gtk",
+
+        "-bios",
+        "/usr/share/OVMF/OVMF_CODE_4M.fd",
+
+        "-rtc",
+        "base=localtime,clock=host",
+
+        "-usb"
+    ]
+
+    gpu = cfg.get("GPU", "")
+    audio = cfg.get("GPU_AUDIO", "")
+
+    if gpu:
+        print("GPU passthrough:", gpu)
+
+        cmd += [
+            "-device",
+            f"vfio-pci,host={gpu}"
+        ]
+
+    if audio:
+        print("GPU Audio passthrough:", audio)
+
+        cmd += [
+            "-device",
+            f"vfio-pci,host={audio}"
+        ]
+
+    print("\nIniciando PC virtual...\n")
+
+    os.execvp(cmd[0], cmd)
+
+
+def check():
+    print("================================")
+    print(" VERIFICAÇÃO DO HOST")
+    print("================================")
+
+    print("\nCPU:")
+
+    cpuinfo = Path("/proc/cpuinfo").read_text()
+
+    if "vmx" in cpuinfo or "svm" in cpuinfo:
+        print("OK - virtualização encontrada")
+    else:
+        print("ERRO - VT-x/AMD-V não encontrado")
+
+    print("\nKVM:")
+
+    if Path("/dev/kvm").exists():
+        print("OK - /dev/kvm encontrado")
+    else:
+        print("ERRO - /dev/kvm não encontrado")
+
+    print("\nGPU:")
+
+    subprocess.run([
+        "bash",
+        "-c",
+        "lspci | grep -Ei 'VGA|3D|Display' || true"
+    ])
+
+    print("\nPCI:")
+
+    subprocess.run([
+        "bash",
+        "-c",
+        "lspci | grep -Ei 'VGA|3D|Display|Audio' || true"
+    ])
+
+
+def stop():
+    print("Para parar uma VM QEMU iniciada diretamente,")
+    print("feche a janela da máquina virtual.")
+    print()
+    print("Se estiver usando libvirt:")
+    print("virsh list")
+    print("virsh shutdown gaming-vm")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Uso:")
+        print("  ./vmctl.py check")
+        print("  ./vmctl.py disk")
+        print("  ./vmctl.py start")
+        print("  ./vmctl.py stop")
+        sys.exit(1)
+
+    cfg = load_config()
+
+    action = sys.argv[1]
+
+    if action == "check":
+        check()
+
+    elif action == "disk":
+        create_disk(cfg)
+
+    elif action == "start":
+        start(cfg)
+
+    elif action == "stop":
+        stop()
+
+    else:
+        print("Comando desconhecido.")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+chmod +x "$PROJECT/vmctl.py"
+
+echo "[6/7] Criando comandos rápidos..."
+
+cat > "$PROJECT/start.sh" <<'EOF'
+#!/usr/bin/env bash
+set -e
+cd "$(dirname "$0")"
+./vmctl.py start
+EOF
+
+cat > "$PROJECT/check.sh" <<'EOF'
+#!/usr/bin/env bash
+set -e
+cd "$(dirname "$0")"
+./vmctl.py check
+EOF
+
+cat > "$PROJECT/disk.sh" <<'EOF'
+#!/usr/bin/env bash
+set -e
+cd "$(dirname "$0")"
+./vmctl.py disk
+EOF
+
+chmod +x "$PROJECT"/*.sh
+
+echo "[7/7] Finalizando..."
+
+echo
+echo "========================================="
+echo "          INSTALAÇÃO CONCLUÍDA"
+echo "========================================="
+echo
+echo "Projeto:"
+echo "$PROJECT"
+echo
+echo "Agora coloque as ISOs em:"
+echo
+echo "$PROJECT/iso/"
+echo
+echo "Exemplo:"
+echo "  $PROJECT/iso/Windows.iso"
+echo "  $PROJECT/iso/virtio-win.iso"
+echo
+echo "Verifique o hardware:"
+echo
+echo "  cd $PROJECT"
+echo "  ./check.sh"
+echo
+echo "Veja a GPU:"
+echo
+echo "  lspci -nn | grep -Ei 'VGA|3D|Display|Audio'"
+echo
+echo "Depois edite:"
+echo
+echo "  nano $PROJECT/vm.env"
+echo
+echo "E inicie:"
+echo
+echo "  cd $PROJECT"
+echo "  ./start.sh"
+echo
+echo "IMPORTANTE:"
+echo "Para GPU passthrough, configure IOMMU/VFIO antes."
+echo "Uma GPU separada para a VM é altamente recomendada."
+echo
+echo "Pode ser necessário fazer logout/login para"
+echo "que os grupos libvirt/kvm tenham efeito."
